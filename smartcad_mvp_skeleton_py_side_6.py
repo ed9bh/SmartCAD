@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SMARTCAD — MVP Skeleton (v0.1)
+SMARTCAD — MVP Skeleton (v0.1b)
 Stack: Python 3.10+, PySide6
 
-Recursos neste MVP:
+Correções nesta versão:
+- **Imports OpenGL corrigidos**: agora usamos `PySide6.QtOpenGL` para `QOpenGLShaderProgram`, `QOpenGLShader`, `QOpenGLVertexArrayObject`, `QOpenGLBuffer`.
+- **Formato do contexto**: força OpenGL **3.3 Core** via `QSurfaceFormat` antes de iniciar a aplicação (melhora compatibilidade em Windows/ANGLE/DRI).
+- **Constantes GL** definidas manualmente (sem PyOpenGL): `GL_COLOR_BUFFER_BIT`, `GL_DEPTH_BUFFER_BIT`, `GL_POINTS`, `GL_LINES`, `GL_DEPTH_TEST`, `GL_FLOAT`.
+
+Recursos:
 - Janela principal (PySide6) com menu: Projeto | Camadas | Inserir | Topografia | Projetos | Exibição | Import/Export | Ajuda
 - Gerenciador de Projeto: criar/abrir estrutura em diretório; project.json com EPSG opcional
 - Gerenciador de Camadas: criar/listar/remover; camada ativa
@@ -12,8 +17,8 @@ Recursos neste MVP:
 - Viewport 3D (QOpenGLWidget) simples com grid e renderização mínima de pontos/linhas
 - Journal (undo/redo) mínimo: apenas registrar operações (sem UI ainda)
 
-Para rodar:
-  pip install PySide6
+Como rodar:
+  pip install PySide6 numpy
   python smartcad_main.py
 """
 from __future__ import annotations
@@ -27,13 +32,26 @@ from typing import List, Dict, Optional, Tuple, Any
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction, QMatrix4x4, QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtGui import QAction
+from PySide6.QtOpenGL import (
+    QOpenGLShaderProgram, QOpenGLShader, QOpenGLVertexArrayObject, QOpenGLBuffer
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QMessageBox, QDockWidget,
     QListWidget, QWidget, QVBoxLayout, QLabel, QFormLayout, QLineEdit,
-    QPushButton, QHBoxLayout, QSpinBox, QDoubleSpinBox, QMenu, QInputDialog
+    QPushButton, QHBoxLayout, QDoubleSpinBox, QMenu, QInputDialog
 )
+
+# ==========================
+# Constantes OpenGL (sem PyOpenGL)
+# ==========================
+GL_COLOR_BUFFER_BIT = 0x00004000
+GL_DEPTH_BUFFER_BIT = 0x00000100
+GL_POINTS = 0x0000
+GL_LINES = 0x0001
+GL_DEPTH_TEST = 0x0B71
+GL_FLOAT = 0x1406
 
 # ==========================
 # Utilidades
@@ -331,7 +349,7 @@ class Viewport3D(QOpenGLWidget):
     # OpenGL
     def initializeGL(self):
         gl = self.context().functions()
-        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glEnable(GL_DEPTH_TEST)
         gl.glClearColor(0.1, 0.1, 0.12, 1.0)
 
     def resizeGL(self, w: int, h: int):
@@ -340,7 +358,7 @@ class Viewport3D(QOpenGLWidget):
 
     def paintGL(self):
         gl = self.context().functions()
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         # Matriz de projeção simples (perspectiva)
         w = max(1, self.width())
@@ -369,7 +387,6 @@ class Viewport3D(QOpenGLWidget):
         draw_lines(gl, lines, mvp)
 
     def draw_entities(self, gl, mvp):
-        # Points
         pts = []
         polylines: List[List[Tuple[float,float,float]]] = []
         for e in self.entities:
@@ -384,7 +401,7 @@ class Viewport3D(QOpenGLWidget):
             draw_lines(gl, segs, mvp)
 
 # ==========================
-# Render helpers (immediate-like)
+# Render helpers (shader pipeline mínimo)
 # ==========================
 import struct
 
@@ -392,7 +409,7 @@ def draw_points(gl, points: List[Tuple[float,float,float]], mvp, size=5):
     if not points:
         return
     gl.glPointSize(size)
-    draw_primitives(gl, gl.GL_POINTS, points, mvp)
+    draw_primitives(gl, GL_POINTS, points, mvp)
 
 
 def draw_lines(gl, segments: List[Tuple[Tuple[float,float,float], Tuple[float,float,float]]], mvp):
@@ -402,16 +419,11 @@ def draw_lines(gl, segments: List[Tuple[Tuple[float,float,float], Tuple[float,fl
     for a,b in segments:
         verts.append(a)
         verts.append(b)
-    draw_primitives(gl, gl.GL_LINES, verts, mvp)
+    draw_primitives(gl, GL_LINES, verts, mvp)
 
 
 def draw_primitives(gl, mode, vertices: List[Tuple[float,float,float]], mvp):
-    # Shader mínimo embutido via QOpenGLFunctions (fixed pipeline emulado)
-    # Como QOpenGLFunctions não compila shaders, usamos glBegin/glEnd não disponível.
-    # Solução: usar QPainter para simplificar no MVP (sem profundidade perfeita) OU
-    # criar um pipeline de shader via QOpenGLShaderProgram.
-    # Aqui: implementamos um pipeline muito simples via QOpenGLShaderProgram.
-    from PySide6.QtGui import QOpenGLShaderProgram, QOpenGLShader
+    # Programa de shader mínimo (uma única instância global)
     if not hasattr(draw_primitives, "prog"):
         prog = QOpenGLShaderProgram()
         vs = QOpenGLShader(QOpenGLShader.Vertex)
@@ -437,16 +449,13 @@ def draw_primitives(gl, mode, vertices: List[Tuple[float,float,float]], mvp):
         draw_primitives.prog = prog
         draw_primitives.vao = None
         draw_primitives.vbo = None
-    prog: QtGui.QOpenGLShaderProgram = draw_primitives.prog
+    prog: QOpenGLShaderProgram = draw_primitives.prog
     if draw_primitives.vao is None:
-        from PySide6.QtGui import QOpenGLVertexArrayObject, QOpenGLBuffer
         draw_primitives.vao = QOpenGLVertexArrayObject()
         draw_primitives.vao.create()
         draw_primitives.vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
         draw_primitives.vbo.create()
 
-    # Upload de vértices
-    from PySide6.QtGui import QOpenGLVertexArrayObject, QOpenGLBuffer
     vao: QOpenGLVertexArrayObject = draw_primitives.vao
     vbo: QOpenGLBuffer = draw_primitives.vbo
 
@@ -459,11 +468,11 @@ def draw_primitives(gl, mode, vertices: List[Tuple[float,float,float]], mvp):
     prog.bind()
     loc = 0
     prog.enableAttributeArray(loc)
-    prog.setAttributeBuffer(loc, QtGui.QOpenGLShaderProgram.Float, 0, 3)
+    prog.setAttributeBuffer(loc, GL_FLOAT, 0, 3)
 
-    # Envia matriz MVP
-    mvp_flat = [c for col in mvp for c in col]  # 4x4 column-major
-    prog.setUniformValue("u_mvp", QtGui.QMatrix4x4(*mvp_flat))
+    # Envia matriz MVP (column-major)
+    mvp_flat = [c for col in mvp for c in col]
+    prog.setUniformValue("u_mvp", QMatrix4x4(*mvp_flat))
 
     gl.glDrawArrays(mode, 0, len(vertices))
 
@@ -489,7 +498,6 @@ def perspective(fovy, aspect, znear, zfar):
 
 
 def mat4_mul(a, b):
-    # a(4x4) * b(4x4)
     r = [[0]*4 for _ in range(4)]
     for i in range(4):
         for j in range(4):
@@ -544,7 +552,6 @@ class LayersDock(QDockWidget):
         if self.pm.layer_manager:
             for name in sorted(self.pm.layer_manager.list_layers()):
                 self.listw.addItem(name)
-            # Seleciona ativa
             for i in range(self.listw.count()):
                 if self.listw.item(i).text() == (self.pm.layer_manager.active if self.pm.layer_manager else "_default"):
                     self.listw.setCurrentRow(i)
@@ -614,7 +621,7 @@ class NewPolylineDialog(QtWidgets.QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SMARTCAD — MVP 0.1")
+        self.setWindowTitle("SMARTCAD — MVP 0.1b")
         self.resize(1280, 800)
 
         self.pm = ProjectManager()
@@ -674,7 +681,7 @@ class MainWindow(QMainWindow):
 
         # Ajuda
         m_help = mb.addMenu("Ajuda")
-        m_help.addAction("Sobre", lambda: QMessageBox.information(self, "Sobre", "SMARTCAD MVP 0.1\nEditor 3D baseado em diretório"))
+        m_help.addAction("Sobre", lambda: QMessageBox.information(self, "Sobre", "SMARTCAD MVP 0.1b\nEditor 3D basado em diretório"))
 
         self.actions_project = [act_save, self.act_new_layer, self.act_del_layer, self.act_new_point, self.act_new_pline, self.act_reset_view]
 
@@ -741,7 +748,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Camadas", str(e))
 
     def on_layer_changed(self, name: str):
-        # Poderíamos filtrar exibição por camada, por ora apenas informa
         self.statusBar().showMessage(f"Camada ativa: {name}")
 
     # -------- Ações de Inserção --------
@@ -793,6 +799,13 @@ class MainWindow(QMainWindow):
 # Main
 # ==========================
 def main():
+    # Define formato padrão do contexto antes de criar a aplicação/GL widgets
+    fmt = QSurfaceFormat()
+    fmt.setRenderableType(QSurfaceFormat.OpenGL)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
+    fmt.setVersion(3, 3)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
