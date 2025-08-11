@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SMARTCAD — MVP Skeleton (v0.1b)
+SMARTCAD — MVP Skeleton (v0.2c)
 Stack: Python 3.10+, PySide6
 
-Correções nesta versão:
-- **Imports OpenGL corrigidos**: agora usamos `PySide6.QtOpenGL` para `QOpenGLShaderProgram`, `QOpenGLShader`, `QOpenGLVertexArrayObject`, `QOpenGLBuffer`.
-- **Formato do contexto**: força OpenGL **3.3 Core** via `QSurfaceFormat` antes de iniciar a aplicação (melhora compatibilidade em Windows/ANGLE/DRI).
-- **Constantes GL** definidas manualmente (sem PyOpenGL): `GL_COLOR_BUFFER_BIT`, `GL_DEPTH_BUFFER_BIT`, `GL_POINTS`, `GL_LINES`, `GL_DEPTH_TEST`, `GL_FLOAT`.
-
-Recursos:
-- Janela principal (PySide6) com menu: Projeto | Camadas | Inserir | Topografia | Projetos | Exibição | Import/Export | Ajuda
-- Gerenciador de Projeto: criar/abrir estrutura em diretório; project.json com EPSG opcional
-- Gerenciador de Camadas: criar/listar/remover; camada ativa
-- Entidades básicas (modelo de dados): Point3D, Polyline3D (persistência em JSON)
-- Viewport 3D (QOpenGLWidget) simples com grid e renderização mínima de pontos/linhas
-- Journal (undo/redo) mínimo: apenas registrar operações (sem UI ainda)
+Novidades v0.2c:
+- **Criação por clique no viewport**
+  - Ponto 3D (clicar): um clique no plano Z=0 cria o ponto.
+  - Polyline 3D (clicar): múltiplos cliques para os vértices; **Enter**/**Duplo-clique**/**Botão direito** finaliza; **Backspace** desfaz último; **Esc** cancela.
+  - Pré-visualização na tela enquanto desenha.
+  - **Snap opcional à grade** (Exibição → Ativar Snap à Grade).
+- **Polyline 3D (Planilha)**
+  - Dialogo com **tabela (X,Y,Z)**, botões **Adicionar/Remover linha**, total de **comprimento**.
+  - Aceita colar de Excel/CSV (padrão do QTableWidget).
+- Ajustes de OpenGL mantidos (imports corretos + contexto 3.3 Core + constantes GL).
 
 Como rodar:
   pip install PySide6 numpy
@@ -26,9 +24,10 @@ import json
 import sys
 import time
 import math
+import numpy as np
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
@@ -40,7 +39,8 @@ from PySide6.QtOpenGL import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QMessageBox, QDockWidget,
     QListWidget, QWidget, QVBoxLayout, QLabel, QFormLayout, QLineEdit,
-    QPushButton, QHBoxLayout, QDoubleSpinBox, QMenu, QInputDialog
+    QPushButton, QHBoxLayout, QDoubleSpinBox, QMenu, QInputDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox
 )
 
 # ==========================
@@ -287,6 +287,11 @@ class EntityStore:
         tmp.write_text(json.dumps(ent.to_json(), ensure_ascii=False, indent=2), encoding='utf-8')
         tmp.replace(path)  # atômico na maioria dos FS
 
+    def delete(self, ent: Entity):
+        path = self.root/ent.layer/f"{ent.id}.entity.json"
+        if path.exists():
+            path.unlink()
+
     def load_all(self) -> List[Entity]:
         ents: List[Entity] = []
         for layer in self.root.glob("*/"):
@@ -307,12 +312,13 @@ class EntityStore:
         return ents
 
 # ==========================
-# Viewport 3D (OpenGL básico)
+# Viewport 3D (OpenGL básico + desenho interativo)
 # ==========================
 class Viewport3D(QOpenGLWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(900, 600)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.camera_dist = 50.0
         self.rot_x = -30.0
         self.rot_y = 45.0
@@ -321,24 +327,95 @@ class Viewport3D(QOpenGLWidget):
         self.grid_size = 100
         self.grid_step = 5
 
+        # Interação de desenho
+        self.mode: str = 'idle'  # 'idle'|'point'|'pline'
+        self.snap_enabled: bool = True
+        self.temp_vertices: List[Tuple[float,float,float]] = []
+        self._proj_np = None
+        self._view_np = None
+        self._mvp_np = None
+        self._eye = np.array([0,0,50.0], dtype=float)
+        self._on_point_created: Optional[Callable[[Tuple[float,float,float]], None]] = None
+        self._on_polyline_created: Optional[Callable[[List[Tuple[float,float,float]]], None]] = None
+
     def set_entities(self, ents: List[Entity]):
         self.entities = ents
         self.update()
 
-    # Interação básica
+    # ---------- Modo desenho ----------
+    def start_point_mode(self, on_created: Callable[[Tuple[float,float,float]], None]):
+        self.mode = 'point'
+        self._on_point_created = on_created
+        self.temp_vertices.clear()
+        self.setCursor(Qt.CrossCursor)
+        self.setFocus()
+
+    def start_polyline_mode(self, on_created: Callable[[List[Tuple[float,float,float]]], None]):
+        self.mode = 'pline'
+        self._on_polyline_created = on_created
+        self.temp_vertices.clear()
+        self.setCursor(Qt.CrossCursor)
+        self.setFocus()
+
+    def finish_polyline(self):
+        if self.mode == 'pline' and len(self.temp_vertices) >= 2 and self._on_polyline_created:
+            verts = list(self.temp_vertices)
+            self._on_polyline_created(verts)
+        self.cancel_drawing()
+
+    def cancel_drawing(self):
+        self.mode = 'idle'
+        self._on_point_created = None
+        self._on_polyline_created = None
+        self.temp_vertices.clear()
+        self.unsetCursor()
+        self.update()
+
+    # ---------- Eventos mouse/teclado ----------
     def mousePressEvent(self, e: QtGui.QMouseEvent):
+        if self.mode in ('point','pline') and e.button() == Qt.LeftButton:
+            p = self._pick_plane_point(e.position().x(), e.position().y())
+            if p is not None:
+                if self.snap_enabled:
+                    p = self._snap_point(p)
+                if self.mode == 'point' and self._on_point_created:
+                    self._on_point_created(p)
+                    self.cancel_drawing()
+                    return
+                elif self.mode == 'pline':
+                    self.temp_vertices.append(p)
+                    self.update()
+                    return
+        if self.mode == 'pline' and e.button() == Qt.RightButton:
+            if len(self.temp_vertices) >= 2:
+                self.finish_polyline()
+                return
+            else:
+                self.cancel_drawing()
+                return
+        # Rotação da câmera
         self.last_pos = e.position().toPoint()
 
+    def mouseDoubleClickEvent(self, e: QtGui.QMouseEvent):
+        if self.mode == 'pline' and e.button() == Qt.LeftButton:
+            if len(self.temp_vertices) >= 2:
+                self.finish_polyline()
+                return
+
     def mouseMoveEvent(self, e: QtGui.QMouseEvent):
-        if self.last_pos is None:
-            return
-        dx = e.position().x() - self.last_pos.x()
-        dy = e.position().y() - self.last_pos.y()
-        if e.buttons() & Qt.LeftButton:
-            self.rot_y += dx * 0.4
-            self.rot_x += dy * 0.4
+        if self.mode not in ('point','pline'):
+            if self.last_pos is None:
+                return
+            dx = e.position().x() - self.last_pos.x()
+            dy = e.position().y() - self.last_pos.y()
+            if e.buttons() & Qt.LeftButton:
+                self.rot_y += dx * 0.4
+                self.rot_x += dy * 0.4
+                self.update()
+            self.last_pos = e.position().toPoint()
+        else:
+            # Atualiza preview do último ponto (não permanente)
             self.update()
-        self.last_pos = e.position().toPoint()
 
     def wheelEvent(self, e: QtGui.QWheelEvent):
         delta = e.angleDelta().y() / 120.0
@@ -346,7 +423,27 @@ class Viewport3D(QOpenGLWidget):
         self.camera_dist = max(5.0, min(1000.0, self.camera_dist))
         self.update()
 
-    # OpenGL
+    def keyPressEvent(self, e: QtGui.QKeyEvent):
+        if self.mode == 'pline':
+            if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if len(self.temp_vertices) >= 2:
+                    self.finish_polyline()
+                    return
+            elif e.key() == Qt.Key_Escape:
+                self.cancel_drawing()
+                return
+            elif e.key() == Qt.Key_Backspace:
+                if self.temp_vertices:
+                    self.temp_vertices.pop()
+                    self.update()
+                    return
+        elif self.mode == 'point':
+            if e.key() == Qt.Key_Escape:
+                self.cancel_drawing()
+                return
+        super().keyPressEvent(e)
+
+    # ---------- OpenGL ----------
     def initializeGL(self):
         gl = self.context().functions()
         gl.glEnable(GL_DEPTH_TEST)
@@ -372,10 +469,18 @@ class Viewport3D(QOpenGLWidget):
 
         mvp = mat4_mul(proj, view)  # sem model matrix (identidade)
 
+        # Guardar versões numpy para unproject
+        self._proj_np = np.array(proj, dtype=float)
+        self._view_np = np.array(view, dtype=float)
+        self._mvp_np = self._proj_np @ self._view_np
+        self._eye = np.array(eye, dtype=float)
+
         # Grid
         self.draw_grid(gl, mvp)
         # Entidades
         self.draw_entities(gl, mvp)
+        # Preview de desenho
+        self.draw_preview(gl, mvp)
 
     def draw_grid(self, gl, mvp):
         lines = []
@@ -399,6 +504,52 @@ class Viewport3D(QOpenGLWidget):
         for pl in polylines:
             segs = list(zip(pl[:-1], pl[1:]))
             draw_lines(gl, segs, mvp)
+
+    def draw_preview(self, gl, mvp):
+        if self.mode == 'pline' and self.temp_vertices:
+            segs = list(zip(self.temp_vertices[:-1], self.temp_vertices[1:]))
+            draw_lines(gl, segs, mvp)
+            draw_points(gl, [self.temp_vertices[-1]], mvp, size=7)
+        elif self.mode == 'point' and self.temp_vertices:
+            draw_points(gl, [self.temp_vertices[-1]], mvp, size=7)
+
+    # ---------- Picking util ----------
+    def _pick_plane_point(self, sx: float, sy: float, plane_z: float = 0.0) -> Optional[Tuple[float,float,float]]:
+        if self._mvp_np is None:
+            return None
+        w = max(1, self.width())
+        h = max(1, self.height())
+        # NDC
+        x_ndc = (2.0 * sx / w) - 1.0
+        y_ndc = 1.0 - (2.0 * sy / h)
+        near_clip = np.array([x_ndc, y_ndc, -1.0, 1.0])
+        far_clip  = np.array([x_ndc, y_ndc,  1.0, 1.0])
+        inv = np.linalg.inv(self._mvp_np)
+        near_world = inv @ near_clip
+        far_world  = inv @ far_clip
+        if abs(near_world[3]) < 1e-6 or abs(far_world[3]) < 1e-6:
+            return None
+        near_world = near_world[:3] / near_world[3]
+        far_world  = far_world[:3] / far_world[3]
+        ray_dir = far_world - near_world
+        ray_dir = ray_dir / (np.linalg.norm(ray_dir) + 1e-12)
+        # Interseção com plano z = plane_z
+        if abs(ray_dir[2]) < 1e-9:
+            return None
+        t = (plane_z - near_world[2]) / ray_dir[2]
+        if t < 0:
+            return None
+        p = near_world + t * ray_dir
+        self.temp_vertices_preview = (float(p[0]), float(p[1]), float(p[2]))
+        return (float(p[0]), float(p[1]), float(p[2]))
+
+    def _snap_point(self, p: Tuple[float,float,float]) -> Tuple[float,float,float]:
+        step = float(self.grid_step)
+        return (
+            round(p[0] / step) * step,
+            round(p[1] / step) * step,
+            round(p[2] / step) * step,
+        )
 
 # ==========================
 # Render helpers (shader pipeline mínimo)
@@ -506,7 +657,6 @@ def mat4_mul(a, b):
 
 
 def look_at(eye, target, up):
-    import numpy as np
     eye = np.array(eye, dtype=float)
     target = np.array(target, dtype=float)
     up = np.array(up, dtype=float)
@@ -566,7 +716,7 @@ class LayersDock(QDockWidget):
                 self.on_layer_change(name)
 
 # ==========================
-# Dialogs de criação de entidades
+# Dialogs de criação de entidades (formulários)
 # ==========================
 class NewPointDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
@@ -592,7 +742,7 @@ class NewPolylineDialog(QtWidgets.QDialog):
         self.setWindowTitle("Nova Polyline 3D")
         vbox = QVBoxLayout(self)
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText("Vertices no formato: x1,y1,z1; x2,y2,z2; ...")
+        self.edit.setPlaceholderText("Vértices: x1,y1,z1; x2,y2,z2; ...")
         vbox.addWidget(QLabel("Informe os vértices (separados por ponto e vírgula):"))
         vbox.addWidget(self.edit)
         btns = QHBoxLayout()
@@ -615,14 +765,88 @@ class NewPolylineDialog(QtWidgets.QDialog):
                 verts.append((nums[0], nums[1], nums[2]))
         return verts
 
+class PolylineTableDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Polyline 3D — Planilha")
+        self.resize(520, 420)
+        vbox = QVBoxLayout(self)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["X","Y","Z"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        vbox.addWidget(self.table)
+
+        btns1 = QHBoxLayout()
+        self.btn_add = QPushButton("Adicionar linha")
+        self.btn_del = QPushButton("Remover linha")
+        btns1.addWidget(self.btn_add)
+        btns1.addWidget(self.btn_del)
+        vbox.addLayout(btns1)
+
+        self.lbl_len = QLabel("Comprimento: 0.000 m")
+        vbox.addWidget(self.lbl_len)
+
+        btns2 = QHBoxLayout()
+        ok = QPushButton("Criar")
+        cancel = QPushButton("Cancelar")
+        btns2.addWidget(ok); btns2.addWidget(cancel)
+        vbox.addLayout(btns2)
+
+        self.btn_add.clicked.connect(self.add_row)
+        self.btn_del.clicked.connect(self.del_row)
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        self.table.itemChanged.connect(self.update_length)
+
+        # duas linhas iniciais
+        self.add_row(); self.add_row()
+
+    def add_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        for c in range(3):
+            self.table.setItem(r, c, QTableWidgetItem("0"))
+        self.update_length()
+
+    def del_row(self):
+        r = self.table.currentRow()
+        if r >= 0:
+            self.table.removeRow(r)
+            self.update_length()
+
+    def vertices(self) -> List[Tuple[float,float,float]]:
+        verts: List[Tuple[float,float,float]] = []
+        for r in range(self.table.rowCount()):
+            try:
+                x = float(self.table.item(r,0).text()) if self.table.item(r,0) else 0.0
+                y = float(self.table.item(r,1).text()) if self.table.item(r,1) else 0.0
+                z = float(self.table.item(r,2).text()) if self.table.item(r,2) else 0.0
+                verts.append((x,y,z))
+            except Exception:
+                pass
+        return verts
+
+    def update_length(self):
+        vs = self.vertices()
+        if len(vs) < 2:
+            self.lbl_len.setText("Comprimento: 0.000 m")
+            return
+        length = 0.0
+        for a,b in zip(vs[:-1], vs[1:]):
+            ax,ay,az = a; bx,by,bz = b
+            length += math.dist((ax,ay,az),(bx,by,bz))
+        self.lbl_len.setText(f"Comprimento: {length:.3f} m")
+
 # ==========================
 # Janela Principal
 # ==========================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SMARTCAD — MVP 0.1b")
-        self.resize(1280, 800)
+        self.setWindowTitle("SMARTCAD — MVP 0.2c")
+        self.resize(1400, 860)
 
         self.pm = ProjectManager()
         self.entity_store: Optional[EntityStore] = None
@@ -662,10 +886,17 @@ class MainWindow(QMainWindow):
 
         # Inserir
         m_ins = mb.addMenu("Inserir")
-        self.act_new_point = QAction("Ponto 3D", self, triggered=self.action_new_point)
-        self.act_new_pline = QAction("Polyline 3D", self, triggered=self.action_new_polyline)
+        self.act_new_point = QAction("Ponto 3D (formulário)", self, triggered=self.action_new_point)
+        self.act_new_point_click = QAction("Ponto 3D (clicar)", self, triggered=self.action_new_point_click)
+        self.act_new_pline = QAction("Polyline 3D (formulário)", self, triggered=self.action_new_polyline)
+        self.act_new_pline_click = QAction("Polyline 3D (clicar)", self, triggered=self.action_new_polyline_click)
+        self.act_new_pline_table = QAction("Polyline 3D (planilha)", self, triggered=self.action_new_polyline_table)
         m_ins.addAction(self.act_new_point)
+        m_ins.addAction(self.act_new_point_click)
+        m_ins.addSeparator()
         m_ins.addAction(self.act_new_pline)
+        m_ins.addAction(self.act_new_pline_click)
+        m_ins.addAction(self.act_new_pline_table)
 
         # Topografia/Projetos (placeholders)
         mb.addMenu("Topografia")
@@ -674,16 +905,25 @@ class MainWindow(QMainWindow):
         # Exibição
         m_view = mb.addMenu("Exibição")
         self.act_reset_view = QAction("Resetar Visão", self, triggered=self.action_reset_view)
+        self.act_snap = QAction("Ativar Snap à Grade", self, checkable=True, checked=True)
+        self.act_snap.toggled.connect(lambda on: self.toggle_snap(on))
         m_view.addAction(self.act_reset_view)
+        m_view.addAction(self.act_snap)
 
         # Import/Export (placeholders)
         mb.addMenu("Import/Export")
 
         # Ajuda
         m_help = mb.addMenu("Ajuda")
-        m_help.addAction("Sobre", lambda: QMessageBox.information(self, "Sobre", "SMARTCAD MVP 0.1b\nEditor 3D basado em diretório"))
+        m_help.addAction("Sobre", lambda: QMessageBox.information(self, "Sobre", "SMARTCAD MVP 0.2c\nEditor 3D baseado em diretório"))
 
-        self.actions_project = [act_save, self.act_new_layer, self.act_del_layer, self.act_new_point, self.act_new_pline, self.act_reset_view]
+        self.actions_project = [act_save, self.act_new_layer, self.act_del_layer,
+                                self.act_new_point, self.act_new_point_click,
+                                self.act_new_pline, self.act_new_pline_click,
+                                self.act_new_pline_table, self.act_reset_view, self.act_snap]
+
+    def toggle_snap(self, on: bool):
+        self.viewport.snap_enabled = on
 
     def _update_actions_enabled(self, enabled: bool):
         for a in getattr(self, 'actions_project', []):
@@ -732,6 +972,7 @@ class MainWindow(QMainWindow):
             return
         self.pm.layer_manager.create(name)
         self.layers_dock.refresh()
+        self.reload_entities()
 
     def action_del_layer(self):
         if not self.pm.layer_manager:
@@ -744,6 +985,7 @@ class MainWindow(QMainWindow):
             self.pm.layer_manager.remove(cur)
             self.pm.layer_manager.active = "_default"
             self.layers_dock.refresh()
+            self.reload_entities()
         except OSError as e:
             QMessageBox.warning(self, "Camadas", str(e))
 
@@ -764,10 +1006,63 @@ class MainWindow(QMainWindow):
                 self.pm.journal.record(JournalOp(op='create', target=eid, before=None, after=ent.to_json()))
             self.reload_entities()
 
+    def action_new_point_click(self):
+        if not (self.pm.layer_manager and self.entity_store):
+            return
+        self.statusBar().showMessage("Modo: Ponto 3D — clique no plano Z=0 (Esc p/ cancelar)")
+        self.viewport.start_point_mode(self._on_point_clicked)
+
+    def _on_point_clicked(self, p: Tuple[float,float,float]):
+        if not self.entity_store or not self.pm.layer_manager:
+            return
+        eid = self.entity_store.new_id()
+        ent = Point3D(id=eid, type='Point3D', layer=self.pm.layer_manager.active,
+                      x=p[0], y=p[1], z=p[2], name=f"Ponto {eid}")
+        self.entity_store.save(ent)
+        if self.pm.journal:
+            self.pm.journal.record(JournalOp(op='create', target=eid, before=None, after=ent.to_json()))
+        self.reload_entities()
+        self.statusBar().clearMessage()
+
     def action_new_polyline(self):
         if not (self.pm.layer_manager and self.entity_store):
             return
         dlg = NewPolylineDialog(self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            verts = dlg.vertices()
+            if len(verts) < 2:
+                QMessageBox.warning(self, "Polyline 3D", "Informe ao menos dois vértices.")
+                return
+            eid = self.entity_store.new_id()
+            ent = Polyline3D(id=eid, type='Polyline3D', layer=self.pm.layer_manager.active,
+                             vertices=verts, closed=False, name=f"Polyline {eid}")
+            self.entity_store.save(ent)
+            if self.pm.journal:
+                self.pm.journal.record(JournalOp(op='create', target=eid, before=None, after=ent.to_json()))
+            self.reload_entities()
+
+    def action_new_polyline_click(self):
+        if not (self.pm.layer_manager and self.entity_store):
+            return
+        self.statusBar().showMessage("Modo: Polyline 3D — clique para adicionar vértices; Enter/d.uplo-clique/direito finaliza; Esc cancela")
+        self.viewport.start_polyline_mode(self._on_polyline_clicked)
+
+    def _on_polyline_clicked(self, verts: List[Tuple[float,float,float]]):
+        if not self.entity_store or not self.pm.layer_manager:
+            return
+        eid = self.entity_store.new_id()
+        ent = Polyline3D(id=eid, type='Polyline3D', layer=self.pm.layer_manager.active,
+                         vertices=verts, closed=False, name=f"Polyline {eid}")
+        self.entity_store.save(ent)
+        if self.pm.journal:
+            self.pm.journal.record(JournalOp(op='create', target=eid, before=None, after=ent.to_json()))
+        self.reload_entities()
+        self.statusBar().clearMessage()
+
+    def action_new_polyline_table(self):
+        if not (self.pm.layer_manager and self.entity_store):
+            return
+        dlg = PolylineTableDialog(self)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             verts = dlg.vertices()
             if len(verts) < 2:
